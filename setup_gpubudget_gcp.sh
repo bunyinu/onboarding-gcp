@@ -11,111 +11,105 @@ fi
 EXTERNAL_ID="$1"
 CALLBACK_TOKEN="$2"
 MODE="$3"
-# Optional 4th arg lets user pin project explicitly; env var also supported.
+# 4th arg is optional Project ID
 PROJECT_ARG="${4:-${GPUBUDGET_PROJECT:-}}"
 
-CALLBACK_URL="https://api.gpubudget.com/api/v1/onboarding/gcp/callback"
-
-# Resolve project: prefer CLI arg, then current config, else interactive pick
+# --- PROJECT SELECTION LOGIC ---
 PROJECT_ID="$PROJECT_ARG"
-if [ -z "$PROJECT_ID" ]; then
-  PROJECT_ID=$(gcloud config get-value project 2>/dev/null || true)
-fi
-if [ -z "$PROJECT_ID" ]; then
-  echo "[gpubudget] No GCP project set. Listing projects..."
-  mapfile -t PROJECTS < <(gcloud projects list --format="value(projectId)" --limit=50)
-  if [ "${#PROJECTS[@]}" -eq 0 ]; then
-    echo "[gpubudget] No projects available. Set one with: gcloud config set project YOUR_PROJECT_ID"
-    exit 1
-  fi
 
-  DEFAULT_PROJECT="${PROJECTS[0]}"
+# If no project ID was provided in arguments, we MUST ask the user (if interactive)
+if [ -z "$PROJECT_ID" ]; then
+  
+  # 1. Check for interactive shell
   if [ -t 0 ]; then
-    echo "[gpubudget] Select a project (default: ${DEFAULT_PROJECT}):"
+    echo "[gpubudget] No project ID provided. Fetching your projects..."
+    
+    # Get current default just for reference
+    CURRENT_DEFAULT=$(gcloud config get-value project 2>/dev/null || true)
+    
+    # List available projects
+    mapfile -t PROJECTS < <(gcloud projects list --format="value(projectId)" --limit=50)
+    
+    if [ "${#PROJECTS[@]}" -eq 0 ]; then
+      echo "No projects found. Please create one or login with 'gcloud auth login'."
+      exit 1
+    fi
+
+    echo "--------------------------------------------------------"
+    echo "Please select the project to onboard:"
+    if [ -n "$CURRENT_DEFAULT" ]; then
+        echo "(Your current active config is: $CURRENT_DEFAULT)"
+    fi
+    
+    # Interactive Menu
+    PS3="Enter the number of your choice: "
     select P in "${PROJECTS[@]}"; do
       if [ -n "$P" ]; then
         PROJECT_ID="$P"
         break
       fi
-      if [ -z "$REPLY" ]; then
-        PROJECT_ID="$DEFAULT_PROJECT"
-        break
-      fi
-      echo "Invalid choice, using default ${DEFAULT_PROJECT}"
-      PROJECT_ID="$DEFAULT_PROJECT"
-      break
+      echo "Invalid selection. Please try again."
     done
+
   else
-    echo "[gpubudget] Non-interactive shell detected; using ${DEFAULT_PROJECT}"
-    PROJECT_ID="$DEFAULT_PROJECT"
+    # 2. Non-interactive mode (CI/CD) fallback
+    # Only here do we auto-select the current config to prevent hanging
+    PROJECT_ID=$(gcloud config get-value project 2>/dev/null || true)
+    if [ -z "$PROJECT_ID" ]; then
+       # If still empty, try to grab the first one from the list
+       PROJECT_ID=$(gcloud projects list --format="value(projectId)" --limit=1)
+    fi
+    
+    if [ -z "$PROJECT_ID" ]; then
+        echo "[gpubudget] Error: No project provided and none could be detected."
+        exit 1
+    fi
+    echo "[gpubudget] Non-interactive mode detected. Using project: $PROJECT_ID"
   fi
 fi
 
-echo "[gpubudget] Using project ${PROJECT_ID}"
+echo "[gpubudget] Onboarding Project: ${PROJECT_ID}"
 gcloud config set project "$PROJECT_ID" >/dev/null 2>&1 || true
 
-# Build a safe service account ID: lowercase, alnum, <=30 chars.
+
+# --- ID GENERATION & ACCOUNT CREATION (Fixed) ---
+
 BASE_ID="gpubgt-${MODE}-${EXTERNAL_ID}"
 SAFE_ID=$(echo "$BASE_ID" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
-HASH_SUFFIX=$(echo -n "$EXTERNAL_ID" | sha1sum | cut -c1-6)
+
+# Truncate to 30 chars max with hash suffix if needed
 if [ "${#SAFE_ID}" -gt 30 ]; then
-  SAFE_ID="$(echo "$SAFE_ID" | cut -c1-$((30-${#HASH_SUFFIX}-1)))-${HASH_SUFFIX}"
+  if command -v sha1sum >/dev/null 2>&1; then
+      HASH_SUFFIX=$(echo -n "$EXTERNAL_ID" | sha1sum | cut -c1-6)
+  else
+      HASH_SUFFIX=$(echo -n "$EXTERNAL_ID" | cksum | cut -d' ' -f1 | cut -c1-6)
+  fi
+  SAFE_ID="$(echo "$SAFE_ID" | cut -c1-23)-${HASH_SUFFIX}"
 fi
+
 SA_EMAIL="${SAFE_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 echo "[gpubudget] Creating service account ${SA_EMAIL}..."
-gcloud iam service-accounts create "$SAFE_ID" \
-  --display-name="gpubudget ${MODE} (${EXTERNAL_ID})" \
-  --project="$PROJECT_ID" || true
 
+if gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
+    echo "[gpubudget] Service account already exists. Skipping creation."
+else
+    gcloud iam service-accounts create "$SAFE_ID" \
+      --display-name="gpubudget ${MODE}" \
+      --project="$PROJECT_ID"
+fi
+
+# Grant Roles
 if [ "$MODE" = "auditor" ]; then
   echo "[gpubudget] Granting viewer roles..."
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${SA_EMAIL}" \
     --role="roles/compute.viewer" \
-    --quiet
+    --quiet >/dev/null
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${SA_EMAIL}" \
     --role="roles/compute.networkViewer" \
-    --quiet
-else
-  echo "[gpubudget] Granting admin roles..."
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/compute.admin" \
-    --quiet
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/storage.admin" \
-    --quiet
+    --quiet >/dev/null
 fi
 
-KEY_FILE="gpubudget-${MODE}-${EXTERNAL_ID}-key.json"
-echo "[gpubudget] Creating key ${KEY_FILE}..."
-gcloud iam service-accounts keys create "${KEY_FILE}" \
-  --iam-account="${SA_EMAIL}" \
-  --project="$PROJECT_ID"
-
-SA_KEY_B64=$(base64 -w0 "${KEY_FILE}" 2>/dev/null || base64 "${KEY_FILE}")
-
-PAYLOAD=$(cat <<EOF_PAYLOAD
-{
-  "provider": "gcp",
-  "mode": "$MODE",
-  "external_id": "$EXTERNAL_ID",
-  "account_id": "$PROJECT_ID",
-  "meta": {
-    "sa_email": "${SA_EMAIL}",
-    "sa_key_b64": "${SA_KEY_B64}"
-  }
-}
-EOF_PAYLOAD
-)
-
-echo "[gpubudget] Sending onboarding callback..."
-curl -sS -X POST "$CALLBACK_URL" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $CALLBACK_TOKEN" \
-  -d "$PAYLOAD"
-
-echo "[gpubudget] Done."
+echo "[gpubudget] Setup complete for project ${PROJECT_ID}."
