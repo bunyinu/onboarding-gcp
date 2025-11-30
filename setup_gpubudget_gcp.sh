@@ -17,14 +17,18 @@ PROJECT_ARG="${4:-${GPUBUDGET_PROJECT:-}}"
 # --- PROJECT SELECTION LOGIC ---
 PROJECT_ID="$PROJECT_ARG"
 
-# If no project ID was provided in arguments, we MUST ask the user (if interactive)
+# If no project ID provided, FORCE interactive menu even if piped via curl
 if [ -z "$PROJECT_ID" ]; then
-  
-  # 1. Check for interactive shell
-  if [ -t 0 ]; then
+    
     echo "[gpubudget] No project ID provided. Fetching your projects..."
     
-    # Get current default just for reference
+    # Check if we have a valid terminal to read from
+    if [ ! -c /dev/tty ]; then
+        echo "Error: Cannot show menu. Please provide PROJECT_ID as the 4th argument."
+        exit 1
+    fi
+
+    # Get current default for reference
     CURRENT_DEFAULT=$(gcloud config get-value project 2>/dev/null || true)
     
     # List available projects
@@ -41,7 +45,7 @@ if [ -z "$PROJECT_ID" ]; then
         echo "(Your current active config is: $CURRENT_DEFAULT)"
     fi
     
-    # Interactive Menu
+    # We redirect input from /dev/tty so the menu works even inside 'curl | bash'
     PS3="Enter the number of your choice: "
     select P in "${PROJECTS[@]}"; do
       if [ -n "$P" ]; then
@@ -49,30 +53,14 @@ if [ -z "$PROJECT_ID" ]; then
         break
       fi
       echo "Invalid selection. Please try again."
-    done
-
-  else
-    # 2. Non-interactive mode (CI/CD) fallback
-    # Only here do we auto-select the current config to prevent hanging
-    PROJECT_ID=$(gcloud config get-value project 2>/dev/null || true)
-    if [ -z "$PROJECT_ID" ]; then
-       # If still empty, try to grab the first one from the list
-       PROJECT_ID=$(gcloud projects list --format="value(projectId)" --limit=1)
-    fi
-    
-    if [ -z "$PROJECT_ID" ]; then
-        echo "[gpubudget] Error: No project provided and none could be detected."
-        exit 1
-    fi
-    echo "[gpubudget] Non-interactive mode detected. Using project: $PROJECT_ID"
-  fi
+    done < /dev/tty
 fi
 
 echo "[gpubudget] Onboarding Project: ${PROJECT_ID}"
 gcloud config set project "$PROJECT_ID" >/dev/null 2>&1 || true
 
 
-# --- ID GENERATION & ACCOUNT CREATION (Fixed) ---
+# --- ID GENERATION & ACCOUNT MANAGEMENT ---
 
 BASE_ID="gpubgt-${MODE}-${EXTERNAL_ID}"
 SAFE_ID=$(echo "$BASE_ID" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
@@ -89,15 +77,20 @@ fi
 
 SA_EMAIL="${SAFE_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 
-echo "[gpubudget] Creating service account ${SA_EMAIL}..."
+echo "[gpubudget] Checking for existing service account ${SA_EMAIL}..."
 
+# DELETE existing account if found (Fresh Start)
 if gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
-    echo "[gpubudget] Service account already exists. Skipping creation."
-else
-    gcloud iam service-accounts create "$SAFE_ID" \
-      --display-name="gpubudget ${MODE}" \
-      --project="$PROJECT_ID"
+    echo "[gpubudget] Found existing account. Deleting it to ensure a fresh setup..."
+    gcloud iam service-accounts delete "$SA_EMAIL" --project="$PROJECT_ID" --quiet
+    echo "[gpubudget] Deleted."
 fi
+
+# Create new account
+echo "[gpubudget] Creating service account..."
+gcloud iam service-accounts create "$SAFE_ID" \
+  --display-name="gpubudget ${MODE}" \
+  --project="$PROJECT_ID"
 
 # Grant Roles
 if [ "$MODE" = "auditor" ]; then
